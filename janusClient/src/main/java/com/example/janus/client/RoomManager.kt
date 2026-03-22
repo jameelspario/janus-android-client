@@ -1,5 +1,7 @@
 package com.example.janus.client
 
+import org.json.JSONArray
+import java.math.BigInteger
 import java.util.concurrent.ConcurrentHashMap
 
 /**
@@ -75,11 +77,11 @@ class RoomManager(private val signalingManager: SignalingManager) {
         roomOptions: RoomCreateOptions?
     ): Boolean {
         // First try to join (most common case - room already exists)
-        sendJoinRequest(roomId, participant) { success, errorMessage, janusRoomId, ownParticipantId ->
+        sendJoinRequest(roomId, participant) { success, errorMessage, janusRoomId, ownParticipantId, pubs ->
 
             if (success) {
                 // Room existed → joined successfully
-                onSuccessfulJoin(roomId, participant, janusRoomId, ownParticipantId, isNewRoom = false)
+                onSuccessfulJoin(roomId, participant, janusRoomId, ownParticipantId, isNewRoom = false, pubs)
                 return@sendJoinRequest
             }
 
@@ -104,10 +106,10 @@ class RoomManager(private val signalingManager: SignalingManager) {
         roomId: Int,
         participant: JanusParticipant
     ): Boolean {
-        sendJoinRequest(roomId, participant) { success, errorMessage, janusRoomId, ownParticipantId ->
+        sendJoinRequest(roomId, participant) { success, errorMessage, janusRoomId, ownParticipantId, pubs ->
 
             if (success) {
-                onSuccessfulJoin(roomId, participant, janusRoomId, ownParticipantId, isNewRoom = false)
+                onSuccessfulJoin(roomId, participant, janusRoomId, ownParticipantId, isNewRoom = false, pubs)
             } else {
                 val msg = errorMessage ?: "Unknown error"
                 consoleLogE("RoomManager", "Guest join failed: $msg")
@@ -124,7 +126,7 @@ class RoomManager(private val signalingManager: SignalingManager) {
     private fun sendJoinRequest(
         roomId: Int,
         participant: JanusParticipant,
-        onResult: (Boolean, String?, Int?, String?) -> Unit
+        onResult: (Boolean, String?, Int?, String?, List<Pair<BigInteger, String>>?) -> Unit
     ) {
         val body = mapOf<String, Any>(
             "request" to "join",
@@ -139,30 +141,42 @@ class RoomManager(private val signalingManager: SignalingManager) {
         signalingManager.sendMessage(
             body = body,
             callback = { response, _ ->
-
+                consoleLogE("-- RoomMgr >> ", response.toString())
                 val janus = response["videoroom"] as? String
                 when (janus) {
                     "event" -> {
                         val error = response["error"] as? String
                         val errorCode = response["error_code"] as? Int
                         if (errorCode == 426) {
-                            onResult(false, "Missing id/room in success response", null, null)
+                            onResult(false, "Missing id/room in success response", null, null, null)
                         }else{
-                            onResult(false, "$error: $errorCode", null, null)
+                            onResult(false, "$error: $errorCode", null, null, null)
                         }
                     }
                     "joined" ->{
                         val participantId = response["id"]?.toString()
                         val roomFromServer = response["room"] as? Int
                         privateId = response["private_id"] as? Int
-                        onResult(true, null, roomFromServer, participantId)
+                        val publishersJson  = response["publishers"] as? JSONArray
+                        val publishers      = mutableListOf<Pair<BigInteger, String>>()
+                        if (publishersJson != null) {
+                            for (i in 0 until publishersJson.length()) {
+                                val pub     = publishersJson.optJSONObject(i) ?: continue
+                                val feedId  = pub.optLong("id").toBigInteger()
+                                val display = pub.optString("display", "")
+                                publishers.add(feedId to display)
+                            }
+                        }
+                        consoleLogE("RoomManager", "joined room=$roomFromServer publishers=${publishers.size}")
+                        onResult(true, null, roomFromServer, participantId, publishers)
+
                     }
                     "error" -> {
                         val err = response["error"] as? String ?: "Unknown Janus error"
-                        onResult(false, err, null, null)
+                        onResult(false, err, null, null, null)
                     }
                     else -> {
-                        onResult(false, "Unexpected response type: $janus", null, null)
+                        onResult(false, "Unexpected response type: $janus", null, null, null)
                     }
                 }
             }
@@ -201,9 +215,9 @@ class RoomManager(private val signalingManager: SignalingManager) {
                     consoleLogE("RoomManager", "Room $roomId created successfully → now joining")
 
                     // Now try to join the freshly created room
-                    sendJoinRequest(roomId, participant) { success, err, r, pId ->
+                    sendJoinRequest(roomId, participant) { success, err, r, pId, pubs ->
                         if (success) {
-                            onSuccessfulJoin(roomId, participant, r, pId, isNewRoom = true)
+                            onSuccessfulJoin(roomId, participant, r, pId, isNewRoom = true, pubs)
                         } else {
                             listener?.onError("Room created but join failed: ${err ?: "unknown"}")
                         }
@@ -225,7 +239,8 @@ class RoomManager(private val signalingManager: SignalingManager) {
         participant: JanusParticipant,
         serverRoomId: Int?,
         participantServerId: String?,
-        isNewRoom: Boolean
+        isNewRoom: Boolean,
+        existingPublishers: List<Pair<BigInteger, String>>?
     ) {
         val finalRoomId = serverRoomId ?: roomId
 
@@ -256,7 +271,7 @@ class RoomManager(private val signalingManager: SignalingManager) {
 
         consoleLogE("RoomManager", "Successfully ${if (isNewRoom) "created & joined" else "joined"} room $finalRoomId")
 
-        listener?.onRoomJoined(room)
+        listener?.onRoomJoined(room, existingPublishers)
         broadcastParticipantJoined(finalRoomId, updatedParticipant)
     }
 
@@ -664,7 +679,7 @@ class RoomManager(private val signalingManager: SignalingManager) {
  * Room event listener interface
  */
 interface JanusRoomEventListener {
-    fun onRoomJoined(room: JanusRoom)
+    fun onRoomJoined(room: JanusRoom, existingPublishers: List<Pair<BigInteger, String>>?)
     fun onRoomLeft(roomId: Int)
     fun onParticipantJoined(participant: JanusParticipant)
     fun onParticipantLeft(participantId: String)

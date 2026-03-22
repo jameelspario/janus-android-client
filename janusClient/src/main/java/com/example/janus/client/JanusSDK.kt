@@ -524,10 +524,26 @@ class JanusSDK(
     }
 
     private fun createRoomEventListener() = object : JanusRoomEventListener {
-        override fun onRoomJoined(room: JanusRoom) {
+        override fun onRoomJoined(room: JanusRoom, existingPublishers: List<Pair<BigInteger, String>>?) {
             stateManager.addRoom(room.roomId)
             roomStreamsMap.putIfAbsent(room.roomId, mutableSetOf())
             sdkEventListener?.onRoomJoined(room)
+
+            existingPublishers?.let { pub ->
+                if (pub.isNotEmpty()) {
+                    consoleLogE(
+                        "JanusSDK",
+                        "Auto-subscribing to ${pub.size} existing publisher(s) in room=${room.roomId}"
+                    )
+                    pub.forEach { (feedId, display) ->
+                        subscriptionManager?.subscribe(
+                            roomId = room.roomId,
+                            display = display,
+                            feedId = feedId
+                        )
+                    }
+                }
+            }
         }
 
         override fun onRoomLeft(roomId: Int) {

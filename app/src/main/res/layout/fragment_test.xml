@@ -1,0 +1,74 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    tools:context=".TestFragment"
+    android:orientation="vertical">
+
+    <org.webrtc.SurfaceViewRenderer
+        android:id="@+id/local_view"
+        android:layout_width="match_parent"
+        android:layout_height="300dp" />
+
+    <androidx.recyclerview.widget.RecyclerView
+        android:id="@+id/recyclerView"
+        android:layout_width="match_parent"
+        android:layout_height="120dp"/>
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <TextView
+            android:id="@+id/txt_attached"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="Attached"
+            android:padding="8dp"/>
+
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <TextView
+                android:id="@+id/txt_join"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Join Room"
+                android:padding="8dp"/>
+
+            <TextView
+                android:id="@+id/txt_leave"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Leave Room"
+                android:padding="8dp"/>
+
+        </LinearLayout>
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="horizontal">
+
+            <TextView
+                android:id="@+id/txt_publish"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Publish Room"
+                android:padding="8dp"/>
+
+            <TextView
+                android:id="@+id/txt_unpublish"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Unpublish Room"
+                android:padding="8dp"/>
+
+        </LinearLayout>
+
+    </LinearLayout>
+
+</LinearLayout>

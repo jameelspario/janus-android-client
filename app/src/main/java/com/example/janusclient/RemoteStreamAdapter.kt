@@ -1,5 +1,6 @@
 package com.example.janusclient
 
+import android.graphics.Color
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
@@ -15,72 +16,64 @@ import org.webrtc.SurfaceViewRenderer
 import org.webrtc.VideoTrack
 import java.math.BigInteger
 
-// ─────────────────────────────────────────────────────────────────────────────
-//  Data model for one remote stream tile
-// ─────────────────────────────────────────────────────────────────────────────
-
 data class RemoteStream(
     val feedId: BigInteger,
     val display: String,
-    val track: VideoTrack            // live track from onRemoteStreamAvailable
+    val track: VideoTrack,
+    val isHost: Boolean = false
 )
-
-// ─────────────────────────────────────────────────────────────────────────────
-//  Adapter
-// ─────────────────────────────────────────────────────────────────────────────
 
 class RemoteStreamAdapter(
     private val eglBaseContext: EglBase.Context,
-    private val sdk: JanusSDK
+    private val sdk: JanusSDK? = null
 ) : ListAdapter<RemoteStream, RemoteStreamAdapter.ViewHolder>(DIFF) {
-
-    // ── ViewHolder ────────────────────────────────────────────────────────────
 
     inner class ViewHolder(root: View) : RecyclerView.ViewHolder(root) {
         val renderer: SurfaceViewRenderer = root.findViewById(R.id.remoteRenderer)
         val txtDisplay: TextView          = root.findViewById(R.id.txtDisplay)
         val progress: ProgressBar         = root.findViewById(R.id.progressBar)
 
-        private var boundFeedId: BigInteger? = null
+        private var boundStream: RemoteStream? = null
 
         fun bind(stream: RemoteStream) {
-            // Release previous binding if we are being recycled onto a different feed
-            if (boundFeedId != null && boundFeedId != stream.feedId) {
-                detach(boundFeedId!!)
+            if (boundStream != null && boundStream?.feedId != stream.feedId) {
+                detach()
             }
-            boundFeedId = stream.feedId
+            boundStream = stream
 
-            txtDisplay.text = stream.display
+            val displayName = if (stream.isHost) "${stream.display} (Host)" else stream.display
+            txtDisplay.text = displayName
+            txtDisplay.setTextColor(if (stream.isHost) Color.YELLOW else Color.WHITE)
 
-//            // Init renderer once (guard against double-init on rebind)
-//            try {
-//                renderer.init(eglBaseContext, null)
-//            } catch (_: Exception) { /* already initialised */ }
+            progress.visibility = View.VISIBLE
 
-            renderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
-//            renderer.setEnableHardwareScaler(true)
+            try {
+                renderer.init(eglBaseContext, null)
+                renderer.setEnableHardwareScaler(true)
+                renderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
+                renderer.setMirror(false)
+            } catch (_: Exception) {}
 
-            // Hide spinner once the first frame arrives
+            stream.track.addSink(renderer)
             renderer.addFrameListener({
                 itemView.post { progress.visibility = View.GONE }
             }, 1f)
-
-            // This calls track.addSink(renderer) inside SubscriptionManager
-            sdk.showRemoteStream(stream.feedId, renderer)
         }
 
         fun recycle() {
-            boundFeedId?.let { detach(it) }
-            boundFeedId = null
+            detach()
         }
 
-        private fun detach(feedId: BigInteger) {
-            sdk.removeRemoteStream(feedId)   // calls track.removeSink(renderer)
-            try { renderer.clearImage() } catch (_: Exception) {}
+        private fun detach() {
+            boundStream?.let { stream ->
+                try {
+                    stream.track.removeSink(renderer)
+                    renderer.clearImage()
+                } catch (_: Exception) {}
+            }
+            boundStream = null
         }
     }
-
-    // ── Adapter overrides ─────────────────────────────────────────────────────
 
     override fun onCreateViewHolder(parent: ViewGroup, viewType: Int): ViewHolder {
         val view = LayoutInflater.from(parent.context)
@@ -97,9 +90,6 @@ class RemoteStreamAdapter(
         holder.recycle()
     }
 
-    // ── Public helpers called from the Fragment ───────────────────────────────
-
-    /** Add or update a stream. Thread-safe — post to main thread before calling. */
     fun addOrUpdate(stream: RemoteStream) {
         val updated = currentList.toMutableList()
         val idx = updated.indexOfFirst { it.feedId == stream.feedId }
@@ -107,20 +97,15 @@ class RemoteStreamAdapter(
         submitList(updated)
     }
 
-    /** Remove a stream by feedId. Thread-safe — post to main thread before calling. */
     fun remove(feedId: BigInteger) {
         val updated = currentList.filter { it.feedId != feedId }
         submitList(updated)
     }
 
-    // ── DiffUtil ──────────────────────────────────────────────────────────────
-
     companion object {
         private val DIFF = object : DiffUtil.ItemCallback<RemoteStream>() {
-            override fun areItemsTheSame(a: RemoteStream, b: RemoteStream) =
-                a.feedId == b.feedId
-            override fun areContentsTheSame(a: RemoteStream, b: RemoteStream) =
-                a.feedId == b.feedId && a.display == b.display
+            override fun areItemsTheSame(a: RemoteStream, b: RemoteStream) = a.feedId == b.feedId
+            override fun areContentsTheSame(a: RemoteStream, b: RemoteStream) = a == b
         }
     }
 }

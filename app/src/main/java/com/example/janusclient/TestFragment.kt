@@ -1,11 +1,15 @@
 package com.example.janusclient
 
+import android.Manifest
+import android.content.pm.PackageManager
 import android.os.Bundle
 import android.view.LayoutInflater
 import android.view.View
 import android.view.ViewGroup
 import android.widget.TextView
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.annotation.ColorInt
+import androidx.core.content.ContextCompat
 import androidx.fragment.app.Fragment
 import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
@@ -58,7 +62,8 @@ class TestFragment : Fragment() {
         val config = JanusSDKConfigBuilder(requireContext())
             .eglContext(eglBase.eglBaseContext)
 //             .serverUrl("wss://bindaslive.com/janus")
-             .serverUrl("wss://janus.conf.meetecho.com/ws")
+//             .serverUrl("wss://janus.conf.meetecho.com/ws")
+             .serverUrl("ws://192.168.1.160:8188")
              .build()
 
         sdk = JanusSDK(requireContext(), config)
@@ -156,6 +161,30 @@ class TestFragment : Fragment() {
         eglBase.release()
     }
 
+    fun requestPermission(hasPermission:() -> Unit){
+
+        val permissionLauncher = registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()){ grant ->
+            var hasDenied = false
+            grant.entries.forEach {
+                if(!it.value){
+                    hasDenied = true
+                }
+            }
+            if(!hasDenied){
+                hasPermission()
+            }
+        }
+
+        val neededPermission = listOf(Manifest.permission.RECORD_AUDIO, Manifest.permission.CAMERA)
+            .filter { ContextCompat.checkSelfPermission(requireContext(), it) == PackageManager.PERMISSION_DENIED }
+            .toTypedArray()
+
+        if (neededPermission.isNotEmpty()){
+            permissionLauncher.launch(neededPermission)
+        }else{
+            hasPermission()
+        }
+    }
 
 }
 

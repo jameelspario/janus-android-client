@@ -148,19 +148,6 @@ class SignalingManager(private val janusServerUrl: String) {
         handle: BigInteger? = null
     ) {
 
-//        val candidate = JSONObject()
-//        val message = JSONObject()
-//
-//        candidate.putOpt("candidate", candidate1)
-//        candidate.putOpt("sdpMid", sdpMid)
-//        candidate.putOpt("sdpMLineIndex", sdpMLineIndex)
-//
-//        message.putOpt("janus", "trickle")
-//        message.putOpt("candidate", candidate)
-//        message.putOpt("transaction", getNextTransactionId())
-//        message.putOpt("session_id", sessionId)
-//        message.putOpt("handle_id", handle ?: handleId)
-
         val candidate = mapOf<String, Any>(
             "candidate" to candidate1,
             "sdpMid" to sdpMid,
@@ -170,18 +157,7 @@ class SignalingManager(private val janusServerUrl: String) {
     }
 
     fun sendTrickleCandidateComplete(streamId: String, handle: BigInteger? = null) {
-//        val candidate = JSONObject()
-//        val message = JSONObject()
-//
-//        candidate.putOpt("completed", true);
-//
-//        message.putOpt("janus", "trickle")
-//        message.putOpt("candidate", candidate)
-//        message.putOpt("transaction", getNextTransactionId())
-//        message.putOpt("session_id", sessionId)
-//        message.putOpt("handle_id", handle ?: handleId)
-//
-//        webSocket.send(message)
+
         val candidate2 = mapOf<String, Any>(
             "completed" to true,
         )
@@ -467,11 +443,36 @@ class SignalingManager(private val janusServerUrl: String) {
                 }
 
                 "event" -> {
-                    val plugin = message.optString("sender")
+//                    val plugin = message.optString("sender")
+//                    val data = message.optJSONObject("plugindata")?.toMap() ?: emptyMap()
+//
+//                    eventListener?.onMessage(data)
+//
+//                    val handler = messageHandlers[plugin]
+//                    if (handler != null) {
+//                        try {
+//                            handler(data)
+//                        } catch (e: Exception) {
+//                            SDKLogger.error("JanusSignaling", "Error in message handler", e)
+//                        }
+//                    }
+
                     val data = message.optJSONObject("plugindata")?.toMap() ?: emptyMap()
 
-                    eventListener?.onMessage(data)
+                    // Build a full message map that includes top-level fields
+                    // (sender, jsep) so SubscriptionManager can handle "updated"
+                    // and pushed "attached" renegotiations which need both.
+                    val fullMessage = buildMap<String, Any> {
+                        putAll(data)                                          // plugindata fields (plugin, data{})
+                        message.optLong("sender").takeIf { it != 0L }
+                            ?.let { put("sender", it) }                      // handle id of the sender
+                        message.optJSONObject("jsep")?.toMap()
+                            ?.let { put("jsep", it) }                        // renegotiation SDP offer
+                    }
 
+                    eventListener?.onMessage(fullMessage)
+
+                    val plugin = message.optString("sender")
                     val handler = messageHandlers[plugin]
                     if (handler != null) {
                         try {
@@ -602,9 +603,30 @@ fun JSONObject.toMap(): Map<String, Any> {
         if (value != null && value != JSONObject.NULL) {
             map[key] = when (value) {
                 is JSONObject -> value.toMap()
+                is org.json.JSONArray -> value.toList()
                 else -> value
             }
         }
     }
     return map
+}
+
+/**
+ * Extension function to convert JSONArray to List.
+ * Each element is recursively converted so the entire tree is
+ * plain Kotlin types with no raw JSON objects remaining.
+ */
+fun org.json.JSONArray.toList(): List<Any> {
+    val list = mutableListOf<Any>()
+    for (i in 0 until length()) {
+        val value = this.opt(i)
+        if (value != null && value != JSONObject.NULL) {
+            list.add(when (value) {
+                is JSONObject        -> value.toMap()
+                is org.json.JSONArray -> value.toList()
+                else                 -> value
+            })
+        }
+    }
+    return list
 }

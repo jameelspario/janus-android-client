@@ -28,8 +28,16 @@ class JanusSurfaceView @JvmOverloads constructor(
         videoTrack?.addSink(this)
     }
 
+    fun renderVideo(videoTrack: com.example.janus.client.track.VideoTrack?) {
+        videoTrack?.addRenderer(this)
+    }
+
     fun clearVideo(videoTrack: VideoTrack?) {
         videoTrack?.removeSink(this)
+    }
+
+    fun clearVideo(videoTrack: com.example.janus.client.track.VideoTrack?) {
+        videoTrack?.removeRenderer(this)
     }
 
     fun releaseRenderer() {

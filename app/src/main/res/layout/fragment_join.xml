@@ -1,0 +1,47 @@
+<?xml version="1.0" encoding="utf-8"?>
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:gravity="center"
+    android:orientation="vertical"
+    android:padding="24dp">
+
+    <TextView
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:text="Janus Video Conference"
+        android:textSize="24sp"
+        android:textStyle="bold"
+        android:layout_marginBottom="32dp"/>
+
+    <EditText
+        android:id="@+id/et_room_id"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="Room ID (e.g. 1234)"
+        android:inputType="number"
+        android:text="1234"
+        android:layout_marginBottom="16dp"/>
+
+    <EditText
+        android:id="@+id/et_display_name"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:hint="Your Name"
+        android:layout_marginBottom="24dp"/>
+
+    <Button
+        android:id="@+id/btn_join_host"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Join as Host"
+        android:layout_marginBottom="8dp"/>
+
+    <Button
+        android:id="@+id/btn_join_guest"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:text="Join as Guest"
+        style="@style/Widget.MaterialComponents.Button.OutlinedButton"/>
+
+</LinearLayout>

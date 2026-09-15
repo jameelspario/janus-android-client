@@ -1,5 +1,8 @@
 package com.example.janus.client
 
+import android.Manifest
+import android.content.pm.PackageManager
+import androidx.core.content.ContextCompat
 import org.json.JSONArray
 import org.webrtc.AudioTrack
 import org.webrtc.IceCandidate
@@ -7,6 +10,8 @@ import org.webrtc.MediaConstraints
 import org.webrtc.MediaStream
 import org.webrtc.PeerConnection
 import org.webrtc.RendererCommon
+import org.webrtc.RtpReceiver
+import org.webrtc.RtpTransceiver
 import org.webrtc.SdpObserver
 import org.webrtc.SessionDescription
 import org.webrtc.SurfaceViewRenderer
@@ -167,15 +172,33 @@ class SubscriptionManager(
 
         val observer = object : SimplePeerConnectionObserver() {
 
-            // Legacy fallback
+            // Modern unified-plan path (stream-webrtc-android ≥ 1.0 / libwebrtc M79+)
+            // Called once per incoming track; this is the primary delivery path.
+            override fun onTrack(transceiver: RtpTransceiver) {
+                val track = transceiver.receiver?.track() ?: return
+                consoleLogE("SubMgr", "onTrack: feed=$feedId kind=${track.kind()}")
+                when (track.kind()) {
+                    "video" -> deliverTrack(feedId, display, track as? VideoTrack, null)
+                    "audio" -> deliverTrack(feedId, display, null, track as? AudioTrack)
+                }
+            }
+
+            // Also handle onAddTrack (fires alongside onTrack on some builds)
+            override fun onAddTrack(receiver: RtpReceiver, streams: Array<MediaStream>) {
+                val track = receiver.track() ?: return
+                consoleLogE("SubMgr", "onAddTrack: feed=$feedId kind=${track.kind()}")
+                when (track.kind()) {
+                    "video" -> deliverTrack(feedId, display, track as? VideoTrack, null)
+                    "audio" -> deliverTrack(feedId, display, null, track as? AudioTrack)
+                }
+            }
+
+            // Legacy plan-B fallback (older builds / SFUs that send a single MediaStream)
             override fun onAddStream(stream: MediaStream) {
+                consoleLogE("SubMgr", "onAddStream: feed=$feedId v=${stream.videoTracks.size} a=${stream.audioTracks.size}")
                 val videoTrack = stream.videoTracks.firstOrNull()
                 val audioTrack = stream.audioTracks.firstOrNull()
-                deliverTrack(
-                    feedId, display,
-                    videoTrack,
-                    audioTrack
-                )
+                deliverTrack(feedId, display, videoTrack, audioTrack)
             }
 
             // Trigger H – network drop or remote side gone
@@ -213,6 +236,13 @@ class SubscriptionManager(
         pc.setRemoteDescription(object : SdpObserver {
             override fun onSetSuccess() {
                 // Step 4 – createAnswer
+                // Explicitly signal that we want to receive audio + video.
+                // Without these constraints a subscriber-only PC (no local tracks)
+                // may produce a sendrecv/inactive answer and Janus won't forward media.
+                val answerConstraints = MediaConstraints().apply {
+                    mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveAudio", "true"))
+                    mandatory.add(MediaConstraints.KeyValuePair("OfferToReceiveVideo", "true"))
+                }
                 pc.createAnswer(object : SimpleSdpObserver() {
                     override fun onCreateSuccess(sdp: SessionDescription) {
                         // Step 5 – setLocalDescription
@@ -249,7 +279,7 @@ class SubscriptionManager(
                         consoleLogE("SubMgr", "createAnswer failed feed=$feedId: $error")
                         cleanupEntry(feedId, sendLeave = true)  // Trigger G
                     }
-                }, MediaConstraints())
+                }, answerConstraints)
             }
             override fun onSetFailure(p0: String?) {
                 consoleLogE("SubMgr", "setRemoteDesc failed feed=$feedId: $p0")
@@ -286,37 +316,46 @@ class SubscriptionManager(
         sdkListener?.onRemoteStreamRemoved(feedId)
     }
 
-    /** Dispose the PeerConnection, both tracks, and any attached renderer. */
-    private fun releaseWebRtcResources(entry: SubscriptionEntry, feedId: BigInteger){
+    /** Dispose the PeerConnection and detach renderer sink. */
+    private fun releaseWebRtcResources(entry: SubscriptionEntry, feedId: BigInteger) {
         try {
             renderers.remove(feedId)?.let { renderer ->
                 entry.videoTrack?.removeSink(renderer)
-                renderer.clearImage()
+                // Do NOT clearImage()/release() here — runs on OkHttp WebSocket
+                // thread. Touching renderer from bg thread = black screen.
+                // UI handles clearImage() in ViewHolder.recycle() on main thread.
             }
-//            entry.videoTrack?.dispose()
-//            entry.audioTrack?.dispose()
-            // dispose() closes ICE + DTLS and releases all native resources
+            // Do NOT dispose tracks individually — pc.dispose() owns them.
+            // track.dispose() before pc.dispose() = SIGABRT (native double-free).
             entry.peerConnection?.dispose()
         } catch (e: Exception) {
             consoleLogE("SubMgr", "releaseWebRtcResources error feed=$feedId: ${e.message}")
         }
     }
 
-    private fun deliverTrack(feedId: BigInteger,
-                             display: String?,
-                             videoTrack: VideoTrack?,
-                             audioTrack: AudioTrack?) {
+    private fun deliverTrack(
+        feedId: BigInteger,
+        display: String?,
+        videoTrack: VideoTrack?,
+        audioTrack: AudioTrack?
+    ) {
         val current = activeSubscriptions[feedId] ?: return
-        // Merge – only update a track type if it hasn't arrived yet
-        val mergedVideo = if (videoTrack != null && current.videoTrack == null) videoTrack else current.videoTrack
-        val mergedAudio = if (audioTrack != null && current.audioTrack == null) audioTrack else current.audioTrack
+        val isFirstVideo = videoTrack != null && current.videoTrack == null
+        val isFirstAudio = audioTrack != null && current.audioTrack == null
 
+        val mergedVideo = if (isFirstVideo) videoTrack else current.videoTrack
+        val mergedAudio = if (isFirstAudio) audioTrack else current.audioTrack
         activeSubscriptions[feedId] = current.copy(videoTrack = mergedVideo, audioTrack = mergedAudio)
 
-        // Attach any pre-registered renderer
-        if (videoTrack != null && current.videoTrack == null) {
+        if (isFirstVideo && videoTrack != null) {
+            // addSink BEFORE notifying the UI so the renderer is already
+            // receiving frames by the time onRemoteStreamAvailable fires.
+            // If a renderer was pre-registered via attachRenderer(), sink into it now.
             renderers[feedId]?.let { videoTrack.addSink(it) }
-            // Notify SDK → UI can now call sdk.showRemoteStream(feedId, renderer)
+
+            // Notify UI — passes the live track so the UI can call
+            // sdk.showRemoteStream(feedId, renderer) which calls attachRenderer().
+            // attachRenderer() guards against double-addSink via the renderers map.
             sdkListener?.onRemoteStreamAvailable(feedId, display, videoTrack)
         }
     }
@@ -329,18 +368,35 @@ class SubscriptionManager(
     }
 
     /**
-     * Attach a SurfaceViewRenderer to a feed.
-     * Safe to call before or after the VideoTrack arrives – either way it will render.
+     * Register a SurfaceViewRenderer for a feed.
+     * Safe to call before or after the VideoTrack arrives.
+     *
+     * renderer.init() is called here (before addSink) so the EGL context
+     * is always ready when the decoder starts pushing frames.
+     * If the track already arrived (deliverTrack already ran), the renderer
+     * is sunk immediately. If it hasn't arrived yet, deliverTrack will sink
+     * it when the stream comes in.
      */
     fun attachRenderer(feedId: BigInteger, renderer: SurfaceViewRenderer) {
-        try {
-            renderer.init(webRtc.eglBaseContext, null)
-        } catch (_: Exception) { /* already initialised */ }
+        try { renderer.init(webRtc.eglBaseContext, null) } catch (_: Exception) {}
         renderer.setMirror(false)
         renderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
         renderer.setEnableHardwareScaler(true)
-        renderers[feedId] = renderer
-        activeSubscriptions[feedId]?.videoTrack?.addSink(renderer)
+
+        val previous = renderers.put(feedId, renderer)
+        // Detach the old renderer if the UI is recycling a view onto a new feed
+        if (previous != null && previous !== renderer) {
+            activeSubscriptions[feedId]?.videoTrack?.removeSink(previous)
+        }
+
+        val track = activeSubscriptions[feedId]?.videoTrack
+        if (track != null) {
+            // Track already arrived — sink now.
+            // removeSink first to be safe against double-sink if called twice.
+            track.removeSink(renderer)
+            track.addSink(renderer)
+        }
+        // If track hasn't arrived yet, deliverTrack() will call addSink() when it does.
     }
 
     /** Remove the renderer for a feed (call when the View is being destroyed). */
@@ -448,36 +504,45 @@ class SubscriptionManager(
                     }
                     println("------------------------")
                     println(data["publishers"]?.javaClass?.name)
-                    val publishersJson = data["publishers"] as? JSONArray
 
-                    consoleLogE("publishers count = ${publishersJson?.length()}")
-                    consoleLogE("publishers = $publishersJson")
+//                    val publishersJson = data["publishers"] as? JSONArray
+//                    consoleLogE("publishers count = ${publishersJson?.length()}")
+//                    consoleLogE("publishers = $publishersJson")
+//                    if(publishersJson!=null) {
+//
+//                        for (i in 0 until (publishersJson.length())) {
+//                            val pub = publishersJson.getJSONObject(i) ?: continue
+//
+//                            pub.let {
+//                                val feedId = pub.optLong("id").toBigInteger()
+//                                val display = pub.optString("display")
+//                                val audioCodec = pub.optString("audio_codec")
+//                                val videoCodec = pub.optString("video_codec")
+//
+//                                consoleLogE(
+//                                    "New publisher",
+//                                    "feed=$feedId, display=$display, audio=$audioCodec, video=$videoCodec"
+//                                )
+//
+//                                // ───────────────────────────────────────────────
+//                                // Decide whether to subscribe
+//                                // ───────────────────────────────────────────────
+//                                subscribe(roomId = roomId, display = display, feedId = feedId)
+//
+//                            }
+//                        }
+//                    }
 
-                    if(publishersJson!=null) {
+                    val publishersList = data["publishers"] as? List<Map<*, *>>
 
-                        for (i in 0 until (publishersJson.length())) {
-                            val pub = publishersJson.getJSONObject(i) ?: continue
-
-                            pub.let {
-                                val feedId = pub.optLong("id").toBigInteger()
-                                val display = pub.optString("display")
-                                val audioCodec = pub.optString("audio_codec")
-                                val videoCodec = pub.optString("video_codec")
-
-                                consoleLogE(
-                                    "New publisher",
-                                    "feed=$feedId, display=$display, audio=$audioCodec, video=$videoCodec"
-                                )
-
-                                // ───────────────────────────────────────────────
-                                // Decide whether to subscribe
-                                // ───────────────────────────────────────────────
-                                subscribe(roomId = roomId, display = display, feedId = feedId)
-
-                            }
+                    if (publishersList != null) {
+                        for (pub in publishersList) {
+                            val feedId  = (pub["id"] as? Number)?.toLong()?.toBigInteger() ?: continue
+                            val display = pub["display"] as? String ?: ""
+                            consoleLogE("SubMgr", "new publisher feed=$feedId display=$display")
+                            subscribe(roomId = roomId, display = display, feedId = feedId)
                         }
                     }
-
 
                     /*
                     sub | {plugin=janus.plugin.videoroom, data={videoroom=event, room=1234, display=asdf, unpublished=7468658616706119}}
@@ -514,66 +579,66 @@ class SubscriptionManager(
                         unsubscribeAllInRoom(roomId)
                     }
                 }
-                "updated" -> {
-                    // Janus is renegotiating the subscriber stream (publisher toggled tracks,
-                    // or stream composition changed). Re-negotiate the existing PC with the new offer.
-                    val senderHandleId = (message["sender"] as? Number)?.toLong()?.toBigInteger()
-
-                    // Find the subscription entry that owns this handle
-                    val entry = activeSubscriptions.values.firstOrNull {
-                        it.subscriberHandleId == senderHandleId
-                    } ?: run {
-                        consoleLogE("SubMgr", "updated: no entry for sender=$senderHandleId")
-                        return
-                    }
-
-                    val jsepMap = message["jsep"] as? Map<*, *> ?: run {
-                        consoleLogE("SubMgr", "updated: no jsep for feed=${entry.feedId}")
-                        return
-                    }
-
-                    val offerSdp = jsepMap["sdp"] as? String ?: run {
-                        consoleLogE("SubMgr", "updated: no sdp for feed=${entry.feedId}")
-                        return
-                    }
-
-                    val pc = entry.peerConnection ?: run {
-                        consoleLogE("SubMgr", "updated: no PC for feed=${entry.feedId}")
-                        return
-                    }
-
-                    val handleId = entry.subscriberHandleId ?: return
-                    val roomId   = entry.roomId
-                    val feedId   = entry.feedId
-
-                    consoleLogE("SubMgr", "updated: re-negotiating feed=$feedId")
-
-                    val remoteOffer = SessionDescription(SessionDescription.Type.OFFER, offerSdp)
-                    pc.setRemoteDescription(object : SdpObserver {
-                        override fun onSetSuccess() {
-                            pc.createAnswer(object : SimpleSdpObserver() {
-                                override fun onCreateSuccess(sdp: SessionDescription) {
-                                    pc.setLocalDescription(object : SimpleSdpObserver() {
-                                        override fun onSetSuccess() {
-                                            signaling.sendMessage(
-                                                body = mapOf("request" to "start", "room" to roomId),
-                                                jsep = mapOf("type" to sdp.type.canonicalForm(), "sdp" to sdp.description),
-                                                handleId = handleId
-                                            ) { resp, _ ->
-                                                consoleLogE("SubMgr", "updated start resp feed=$feedId: $resp")
-                                            }
-                                        }
-                                        override fun onSetFailure(e: String) { consoleLogE("SubMgr", "updated setLocal fail feed=$feedId: $e") }
-                                    }, sdp)
-                                }
-                                override fun onCreateFailure(e: String) { consoleLogE("SubMgr", "updated createAnswer fail feed=$feedId: $e") }
-                            }, MediaConstraints())
-                        }
-                        override fun onSetFailure(e: String?) { consoleLogE("SubMgr", "updated setRemote fail feed=$feedId: $e") }
-                        override fun onCreateSuccess(p0: SessionDescription?) {}
-                        override fun onCreateFailure(p0: String?) {}
-                    }, remoteOffer)
-                }
+//                "updated" -> {
+//                    // Janus is renegotiating the subscriber stream (publisher toggled tracks,
+//                    // or stream composition changed). Re-negotiate the existing PC with the new offer.
+//                    val senderHandleId = (message["sender"] as? Number)?.toLong()?.toBigInteger()
+//
+//                    // Find the subscription entry that owns this handle
+//                    val entry = activeSubscriptions.values.firstOrNull {
+//                        it.subscriberHandleId == senderHandleId
+//                    } ?: run {
+//                        consoleLogE("SubMgr", "updated: no entry for sender=$senderHandleId")
+//                        return
+//                    }
+//
+//                    val jsepMap = message["jsep"] as? Map<*, *> ?: run {
+//                        consoleLogE("SubMgr", "updated: no jsep for feed=${entry.feedId}")
+//                        return
+//                    }
+//
+//                    val offerSdp = jsepMap["sdp"] as? String ?: run {
+//                        consoleLogE("SubMgr", "updated: no sdp for feed=${entry.feedId}")
+//                        return
+//                    }
+//
+//                    val pc = entry.peerConnection ?: run {
+//                        consoleLogE("SubMgr", "updated: no PC for feed=${entry.feedId}")
+//                        return
+//                    }
+//
+//                    val handleId = entry.subscriberHandleId ?: return
+//                    val roomId   = entry.roomId
+//                    val feedId   = entry.feedId
+//
+//                    consoleLogE("SubMgr", "updated: re-negotiating feed=$feedId")
+//
+//                    val remoteOffer = SessionDescription(SessionDescription.Type.OFFER, offerSdp)
+//                    pc.setRemoteDescription(object : SdpObserver {
+//                        override fun onSetSuccess() {
+//                            pc.createAnswer(object : SimpleSdpObserver() {
+//                                override fun onCreateSuccess(sdp: SessionDescription) {
+//                                    pc.setLocalDescription(object : SimpleSdpObserver() {
+//                                        override fun onSetSuccess() {
+//                                            signaling.sendMessage(
+//                                                body = mapOf("request" to "start", "room" to roomId),
+//                                                jsep = mapOf("type" to sdp.type.canonicalForm(), "sdp" to sdp.description),
+//                                                handleId = handleId
+//                                            ) { resp, _ ->
+//                                                consoleLogE("SubMgr", "updated start resp feed=$feedId: $resp")
+//                                            }
+//                                        }
+//                                        override fun onSetFailure(e: String) { consoleLogE("SubMgr", "updated setLocal fail feed=$feedId: $e") }
+//                                    }, sdp)
+//                                }
+//                                override fun onCreateFailure(e: String) { consoleLogE("SubMgr", "updated createAnswer fail feed=$feedId: $e") }
+//                            }, MediaConstraints())
+//                        }
+//                        override fun onSetFailure(e: String?) { consoleLogE("SubMgr", "updated setRemote fail feed=$feedId: $e") }
+//                        override fun onCreateSuccess(p0: SessionDescription?) {}
+//                        override fun onCreateFailure(p0: String?) {}
+//                    }, remoteOffer)
+//                }
 
                 // You can handle other videoroom event types here too
                 "joined" -> { /* ... */ }
@@ -589,4 +654,6 @@ class SubscriptionManager(
             e.printStackTrace()
         }
     }
+
+
 }

@@ -142,7 +142,6 @@ class WebRTCManager(
         }catch (e:Exception){
             null
         }
-//
 //        return peerConnectionFactory.createPeerConnection(
 //            rtcConfig,
 //            object : PeerConnection.Observer {

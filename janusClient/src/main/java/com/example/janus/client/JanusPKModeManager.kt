@@ -1,5 +1,6 @@
 package com.example.janus.client
 
+import kotlinx.coroutines.*
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 
@@ -7,9 +8,10 @@ import java.util.concurrent.atomic.AtomicBoolean
  * Manages PK (Player Kill/Battle) mode between two rooms
  */
 class JanusPKModeManager(private val roomManager: RoomManager) {
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Default)
     private var currentPKMode: PKModeConfig? = null
     private val pkModeActive = AtomicBoolean(false)
-    private var pkTimer: Thread? = null
+    private var pkTimerJob: Job? = null
     private val listeners = ConcurrentHashMap<String, PKModeListener>()
 
     /**
@@ -91,8 +93,8 @@ class JanusPKModeManager(private val roomManager: RoomManager) {
                 currentPKMode = null
 
                 // Cancel timer if running
-                pkTimer?.interrupt()
-                pkTimer = null
+                pkTimerJob?.cancel()
+                pkTimerJob = null
 
                 // Notify listeners
                 notifyPKStopped(pkMode)
@@ -200,18 +202,18 @@ class JanusPKModeManager(private val roomManager: RoomManager) {
      * Start auto-stop timer
      */
     private fun startPKTimer(durationMs: Long) {
-        pkTimer = Thread {
+        pkTimerJob?.cancel()
+        pkTimerJob = scope.launch {
             try {
-                Thread.sleep(durationMs)
+                delay(durationMs)
                 if (pkModeActive.get()) {
                     stopPKMode()
                     consoleLogE("JanusPKModeManager", "PK mode auto-stopped after timeout")
                 }
-            } catch (e: InterruptedException) {
-                consoleLogE("JanusPKModeManager", "PK timer interrupted")
+            } catch (_: CancellationException) {
+                consoleLogE("JanusPKModeManager", "PK timer cancelled")
             }
-        }.apply { isDaemon = true }
-        pkTimer?.start()
+        }
     }
 
     /**

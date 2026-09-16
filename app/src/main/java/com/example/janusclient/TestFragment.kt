@@ -61,8 +61,6 @@ class TestFragment : Fragment() {
 
         val config = JanusSDKConfigBuilder(requireContext())
             .eglContext(eglBase.eglBaseContext)
-//             .serverUrl("wss://bindaslive.com/janus")
-//             .serverUrl("wss://janus.conf.meetecho.com/ws")
              .serverUrl("ws://192.168.1.160:8188")
              .build()
 

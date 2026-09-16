@@ -1,5 +1,7 @@
+## Janus Android Client
 
 ### Add it in your root settings.gradle at the end of repositories:
+
 
 ```agsl
 dependencyResolutionManagement {

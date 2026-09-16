@@ -203,8 +203,8 @@ class ConferenceFragment : Fragment() {
             try {
                 val userId = UUID.randomUUID().toString().substring(0, 8)
                 room.connect(
-//                    url = "wss://janus.conf.meetecho.com/ws",
-                    url = "ws://192.168.1.160:8188",
+                    url = "wss://janus.conf.meetecho.com/ws",
+//                    url = "ws://192.168.1.160:8188",
                     roomId = roomId,
                     userId = userId,
                     displayName = displayName,

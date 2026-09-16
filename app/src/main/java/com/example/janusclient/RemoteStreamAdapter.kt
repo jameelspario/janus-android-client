@@ -9,7 +9,6 @@ import android.widget.TextView
 import androidx.recyclerview.widget.DiffUtil
 import androidx.recyclerview.widget.ListAdapter
 import androidx.recyclerview.widget.RecyclerView
-import com.example.janus.client.JanusSDK
 import org.webrtc.EglBase
 import org.webrtc.RendererCommon
 import org.webrtc.SurfaceViewRenderer
@@ -25,7 +24,6 @@ data class RemoteStream(
 
 class RemoteStreamAdapter(
     private val eglBaseContext: EglBase.Context,
-    private val sdk: JanusSDK? = null
 ) : ListAdapter<RemoteStream, RemoteStreamAdapter.ViewHolder>(DIFF) {
 
     inner class ViewHolder(root: View) : RecyclerView.ViewHolder(root) {
@@ -34,8 +32,10 @@ class RemoteStreamAdapter(
         val progress: ProgressBar         = root.findViewById(R.id.progressBar)
 
         private var boundStream: RemoteStream? = null
+        private var rendererInitialized = false
 
         fun bind(stream: RemoteStream) {
+            // Detach old stream if we're rebinding to a different feed
             if (boundStream != null && boundStream?.feedId != stream.feedId) {
                 detach()
             }
@@ -47,14 +47,25 @@ class RemoteStreamAdapter(
 
             progress.visibility = View.VISIBLE
 
-            try {
-                renderer.init(eglBaseContext, null)
-                renderer.setEnableHardwareScaler(true)
-                renderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
-                renderer.setMirror(false)
-            } catch (_: Exception) {}
+            // Only init the renderer once per ViewHolder lifetime to avoid
+            // IllegalStateException and broken EGL context on rebind.
+            if (!rendererInitialized) {
+                try {
+                    renderer.init(eglBaseContext, null)
+                    renderer.setEnableHardwareScaler(true)
+                    renderer.setScalingType(RendererCommon.ScalingType.SCALE_ASPECT_FIT)
+                    renderer.setMirror(false)
+                    // Required so SurfaceView draws on top of the window surface
+                    // inside a RecyclerView – without this the view is black.
+                    renderer.setZOrderMediaOverlay(true)
+                    rendererInitialized = true
+                } catch (_: Exception) {}
+            }
 
+            // Always remove before adding to prevent double-sink (causes black frames).
+            try { stream.track.removeSink(renderer) } catch (_: Exception) {}
             stream.track.addSink(renderer)
+
             renderer.addFrameListener({
                 itemView.post { progress.visibility = View.GONE }
             }, 1f)

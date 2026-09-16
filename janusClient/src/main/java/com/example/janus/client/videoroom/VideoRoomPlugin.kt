@@ -12,8 +12,6 @@ import com.example.janus.client.webrtc.WebRtcEngine
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
-import org.json.JSONArray
-import org.json.JSONObject
 import org.webrtc.DataChannel
 import org.webrtc.IceCandidate
 import org.webrtc.MediaConstraints
@@ -25,7 +23,8 @@ import org.webrtc.SessionDescription
 import java.math.BigInteger
 
 /**
- * Coordinates the Janus VideoRoom plugin protocol for publishing, room joining, and signaling events.
+ * Coordinates the Janus VideoRoom plugin protocol for publishing, room joining, and
+ * unsolicited signaling events (new publishers, leaving publishers, room destroyed, etc.).
  */
 class VideoRoomPlugin(
     private val scope: CoroutineScope,
@@ -41,13 +40,19 @@ class VideoRoomPlugin(
     var publisherHandleId: BigInteger? = null
         internal set
 
+    /** Stored after a successful publisher join; passed to subscriber join as private_id. */
     var privateId: Int? = null
         internal set
 
     private var publisherPeerConnection: PeerConnection? = null
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Room Join
+    // ─────────────────────────────────────────────────────────────────────────
+
     /**
-     * Joins (or creates and joins) a VideoRoom room.
+     * Joins (or creates and joins) a VideoRoom room as a publisher.
+     * Returns the join result including any pre-existing publishers with their stream mids.
      */
     suspend fun joinRoom(
         roomId: Int,
@@ -60,8 +65,8 @@ class VideoRoomPlugin(
 
         val joinBody = mapOf<String, Any>(
             "request" to "join",
-            "room" to roomId,
-            "ptype" to "publisher",
+            "room"    to roomId,
+            "ptype"   to "publisher",
             "display" to displayName
         )
 
@@ -73,32 +78,34 @@ class VideoRoomPlugin(
             return parseJoinResponse(roomId, pluginData)
         }
 
-        // Check if room needs to be created first (HOST role only)
+        // Room does not exist — HOST can create it
         val errorCode = pluginData["error_code"] as? Int ?: response.errorCode
-        if (errorCode == 427 || (errorCode == 426 && role == UserRole.HOST)) {
-            if (role == UserRole.HOST) {
-                SDKLogger.info(TAG, "Room $roomId does not exist, creating as HOST...")
-                createRoom(sId, hId, roomId, displayName)
-                // Retry join
-                val retryResponse = signalingClient.sendMessage(sId, hId, joinBody)
-                return parseJoinResponse(roomId, retryResponse.pluginDataMap)
-            }
+        if ((errorCode == 427 || errorCode == 426) && role == UserRole.HOST) {
+            SDKLogger.info(TAG, "Room $roomId does not exist, creating as HOST...")
+            createRoom(sId, hId, roomId, displayName)
+            val retryResponse = signalingClient.sendMessage(sId, hId, joinBody)
+            return parseJoinResponse(roomId, retryResponse.pluginDataMap)
         }
 
         val errorReason = pluginData["error"] as? String ?: response.error ?: "Unknown join error"
         throw RuntimeException("Join room failed: $errorReason (code $errorCode)")
     }
 
-    private suspend fun createRoom(sessionId: BigInteger, handleId: BigInteger, roomId: Int, displayName: String) {
+    private suspend fun createRoom(
+        sessionId: BigInteger,
+        handleId: BigInteger,
+        roomId: Int,
+        displayName: String
+    ) {
         val createBody = mapOf<String, Any>(
-            "request" to "create",
-            "room" to roomId,
-            "ptype" to "publisher",
-            "display" to displayName,
+            "request"     to "create",
+            "room"        to roomId,
+            "ptype"       to "publisher",
+            "display"     to displayName,
             "description" to "Room $roomId",
-            "publishers" to 20,
-            "bitrate" to 2_000_000,
-            "fir_freq" to 10,
+            "publishers"  to 20,
+            "bitrate"     to 2_000_000,
+            "fir_freq"    to 10,
             "require_pvtid" to true
         )
         val resp = signalingClient.sendMessage(sessionId, handleId, createBody)
@@ -110,29 +117,66 @@ class VideoRoomPlugin(
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Response Parsing
+    // ─────────────────────────────────────────────────────────────────────────
+
     private fun parseJoinResponse(roomId: Int, data: Map<String, Any>): VideoRoomJoinResult {
         val participantId = data["id"]?.toString() ?: ""
         privateId = (data["private_id"] as? Number)?.toInt()
-        val publishers = mutableListOf<PublisherFeedInfo>()
 
-        val pubsList = data["publishers"] as? List<*>
-        pubsList?.forEach { item ->
-            if (item is Map<*, *>) {
-                val feedId = (item["id"] as? Number)?.toLong()?.toBigInteger()
-                val display = item["display"] as? String ?: ""
-                val audioCodec = item["audio_codec"] as? String
-                val videoCodec = item["video_codec"] as? String
-                if (feedId != null) {
-                    publishers.add(PublisherFeedInfo(feedId, display, audioCodec, videoCodec))
-                }
-            }
-        }
+        val publishers = parsePublishersList(data["publishers"] as? List<*>)
+
+        SDKLogger.info(TAG, "Joined room $roomId as $participantId (privateId=$privateId), " +
+            "found ${publishers.size} existing publisher(s)")
 
         return VideoRoomJoinResult(roomId, participantId, privateId, publishers)
     }
 
     /**
-     * Publishes local media tracks to the VideoRoom.
+     * Parses the `publishers[]` array from any Janus VideoRoom response.
+     * Each publisher entry may contain a `streams[]` sub-array with per-mid info.
+     *
+     * Mirrors the JS loop in videoroomtest.js:
+     * ```js
+     * for(let f in list) {
+     *     let streams = list[f]["streams"];
+     *     for(let i in streams) { stream["id"] = id; stream["display"] = display; }
+     * }
+     * ```
+     */
+    private fun parsePublishersList(pubsList: List<*>?): List<PublisherFeedInfo> {
+        if (pubsList == null) return emptyList()
+        return pubsList.mapNotNull { item ->
+            if (item !is Map<*, *>) return@mapNotNull null
+            val feedId  = (item["id"] as? Number)?.toLong()?.toBigInteger() ?: return@mapNotNull null
+            val display = item["display"] as? String ?: ""
+            // Skip dummy entries
+            if (item["dummy"] == true) return@mapNotNull null
+            val streams = parsePublisherStreams(item["streams"] as? List<*>)
+            PublisherFeedInfo(feedId, display, streams)
+        }
+    }
+
+    /** Parses the per-publisher `streams[]` sub-array. */
+    private fun parsePublisherStreams(streamsList: List<*>?): List<PublisherStreamInfo> {
+        if (streamsList == null) return emptyList()
+        return streamsList.mapNotNull { item ->
+            if (item !is Map<*, *>) return@mapNotNull null
+            val mid   = item["mid"] as? String ?: return@mapNotNull null
+            val type  = item["type"] as? String ?: return@mapNotNull null
+            val codec = item["codec"] as? String
+            PublisherStreamInfo(mid, type, codec)
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Local Publishing
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Publishes local audio/video tracks to the VideoRoom.
+     * Uses the `configure` request with an SDP offer (matching videoroomtest.js).
      */
     suspend fun publishLocalStream(
         roomId: Int,
@@ -143,13 +187,13 @@ class VideoRoomPlugin(
         val hId = publisherHandleId ?: throw IllegalStateException("Handle not attached")
 
         val observer = object : PeerConnection.Observer {
-            override fun onSignalingChange(newState: PeerConnection.SignalingState) {}
-            override fun onIceConnectionChange(newState: PeerConnection.IceConnectionState) {
-                SDKLogger.debug(TAG, "Publisher ICE Connection State: $newState")
+            override fun onSignalingChange(s: PeerConnection.SignalingState) {}
+            override fun onIceConnectionChange(s: PeerConnection.IceConnectionState) {
+                SDKLogger.debug(TAG, "Publisher ICE: $s")
             }
-            override fun onIceConnectionReceivingChange(receiving: Boolean) {}
-            override fun onIceGatheringChange(newState: PeerConnection.IceGatheringState) {
-                if (newState == PeerConnection.IceGatheringState.COMPLETE) {
+            override fun onIceConnectionReceivingChange(r: Boolean) {}
+            override fun onIceGatheringChange(s: PeerConnection.IceGatheringState) {
+                if (s == PeerConnection.IceGatheringState.COMPLETE) {
                     scope.launch(Dispatchers.IO) {
                         signalingClient.sendTrickleCandidate(sId, hId, null)
                     }
@@ -157,25 +201,24 @@ class VideoRoomPlugin(
             }
             override fun onIceCandidate(candidate: IceCandidate) {
                 scope.launch(Dispatchers.IO) {
-                    val map = mapOf<String, Any>(
-                        "candidate" to candidate.sdp,
-                        "sdpMid" to candidate.sdpMid,
+                    signalingClient.sendTrickleCandidate(sId, hId, mapOf(
+                        "candidate"     to candidate.sdp,
+                        "sdpMid"        to candidate.sdpMid,
                         "sdpMLineIndex" to candidate.sdpMLineIndex
-                    )
-                    signalingClient.sendTrickleCandidate(sId, hId, map)
+                    ))
                 }
             }
-            override fun onIceCandidatesRemoved(candidates: Array<IceCandidate>) {}
-            override fun onAddStream(stream: MediaStream) {}
-            override fun onRemoveStream(stream: MediaStream) {}
-            override fun onDataChannel(dataChannel: DataChannel) {}
+            override fun onIceCandidatesRemoved(c: Array<IceCandidate>) {}
+            override fun onAddStream(s: MediaStream) {}
+            override fun onRemoveStream(s: MediaStream) {}
+            override fun onDataChannel(d: DataChannel) {}
             override fun onRenegotiationNeeded() {}
-            override fun onAddTrack(receiver: RtpReceiver, streams: Array<MediaStream>) {}
-            override fun onTrack(transceiver: RtpTransceiver) {}
+            override fun onAddTrack(r: RtpReceiver, s: Array<MediaStream>) {}
+            override fun onTrack(t: RtpTransceiver) {}
         }
 
         val pc = webRtcEngine.createPeerConnection(observer)
-            ?: throw RuntimeException("Failed to create PeerConnection for publisher")
+            ?: throw RuntimeException("Failed to create publisher PeerConnection")
         publisherPeerConnection = pc
 
         audioTrack?.let { pc.addTrack(it.rtcAudioTrack) }
@@ -190,31 +233,32 @@ class VideoRoomPlugin(
         val offer = pc.createOfferSuspend(mediaConstraints)
         pc.setLocalDescriptionSuspend(offer)
 
-        val publishBody = mapOf<String, Any>(
-            "request" to "publish",
-            "audio" to (audioTrack != null),
-            "video" to (videoTrack != null)
+        // Send configure + SDP offer (matches videoroomtest.js publishOwnFeed)
+        val configureBody = mapOf<String, Any>(
+            "request" to "configure",
+            "audio"   to (audioTrack != null),
+            "video"   to (videoTrack != null)
         )
         val jsepOffer = mapOf<String, Any>(
             "type" to offer.type.canonicalForm(),
-            "sdp" to offer.description
+            "sdp"  to offer.description
         )
 
-        val response = signalingClient.sendMessage(sId, hId, publishBody, jsepOffer)
-        val answerJsep = response.jsep ?: throw RuntimeException("No JSEP answer received for publish: ${response.rawJson}")
-        val answerSdp = answerJsep["sdp"] as? String ?: throw RuntimeException("No SDP in answer JSEP")
+        val response = signalingClient.sendMessage(sId, hId, configureBody, jsepOffer)
+        val answerJsep = response.jsep
+            ?: throw RuntimeException("No JSEP answer for configure: ${response.rawJson}")
+        val answerSdp  = answerJsep["sdp"] as? String
+            ?: throw RuntimeException("No SDP in answer JSEP")
 
-        val remoteAnswer = SessionDescription(SessionDescription.Type.ANSWER, answerSdp)
-        pc.setRemoteDescriptionSuspend(remoteAnswer)
+        pc.setRemoteDescriptionSuspend(SessionDescription(SessionDescription.Type.ANSWER, answerSdp))
 
-        SDKLogger.info(TAG, "Publisher stream published and remote answer applied")
+        SDKLogger.info(TAG, "Publisher stream configured and remote answer applied")
         return pc
     }
 
     suspend fun unpublishLocalStream() {
         val sId = sessionId ?: return
         val hId = publisherHandleId ?: return
-
         try {
             signalingClient.sendMessage(sId, hId, mapOf("request" to "unpublish"))
         } catch (e: Exception) {
@@ -228,59 +272,82 @@ class VideoRoomPlugin(
     suspend fun leaveRoom(roomId: Int) {
         val sId = sessionId ?: return
         val hId = publisherHandleId ?: return
-
         try {
             unpublishLocalStream()
             signalingClient.sendMessage(sId, hId, mapOf("request" to "leave", "room" to roomId))
         } catch (e: Exception) {
-            SDKLogger.warn(TAG, "Leave room request error: ${e.message}")
+            SDKLogger.warn(TAG, "Leave room error: ${e.message}")
         }
     }
 
+    // ─────────────────────────────────────────────────────────────────────────
+    // Unsolicited Event Routing
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Routes unsolicited Janus events to the appropriate handler.
+     *
+     *  - Events from the **subscriber handle** → [RemoteSubscriptionManager.handleUnsolicitedEvent]
+     *  - Events from the **publisher handle** → handled inline below:
+     *      - `publishers[]`  → new feeds available  → [subscribeTo]
+     *      - `leaving`       → publisher left        → [unsubscribeFrom]
+     *      - `unpublished`   → publisher unpublished → [unsubscribeFrom]
+     *      - `destroyed`     → room destroyed        → [unsubscribeAll]
+     */
     fun handleUnsolicitedEvent(eventMap: Map<String, Any>, roomId: Int?) {
         val data = eventMap["data"] as? Map<*, *> ?: return
         val videoroom = data["videoroom"] as? String ?: return
         val currentRoom = (data["room"] as? Number)?.toInt() ?: roomId ?: return
         val sId = sessionId ?: return
+        val senderHandleId = eventMap["sender"] as? BigInteger
+
+        // ── Route subscriber-handle events ──────────────────────────────────
+        if (senderHandleId != null && senderHandleId != publisherHandleId) {
+            val jsep = eventMap["jsep"] as? Map<String, Any>
+            subscriptionManager.handleUnsolicitedEvent(sId, senderHandleId, eventMap, jsep)
+            return
+        }
+
+        // ── Publisher-handle events ─────────────────────────────────────────
+        @Suppress("UNCHECKED_CAST")
+        val dataMap = data as Map<String, Any>
 
         when (videoroom) {
             "event" -> {
-                // Check for new publishers list
-                val publishersList = data["publishers"] as? List<*>
-                publishersList?.forEach { item ->
-                    if (item is Map<*, *>) {
-                        val feedId = (item["id"] as? Number)?.toLong()?.toBigInteger()
-                        val display = item["display"] as? String ?: ""
-                        if (feedId != null) {
-                            SDKLogger.info(TAG, "New publisher feed discovered: $feedId ($display)")
-                            subscriptionManager.subscribe(sId, currentRoom, feedId, display)
-                        }
+                // New publisher(s) joined
+                val publishersList = dataMap["publishers"] as? List<*>
+                if (publishersList != null) {
+                    val feeds = parsePublishersList(publishersList)
+                    if (feeds.isNotEmpty()) {
+                        SDKLogger.info(TAG, "${feeds.size} new publisher(s) in room $currentRoom: ${feeds.map { it.feedId }}")
+                        // Single subscribeTo call — uses "update" if handle already exists
+                        subscriptionManager.subscribeTo(sId, currentRoom, privateId, feeds)
                     }
                 }
 
-                // Check for unpublished feed
-                val unpublished = data["unpublished"]
+                // Publisher unpublished their stream
+                val unpublished = dataMap["unpublished"]
                 if (unpublished != null && unpublished != "ok") {
                     val feedId = (unpublished as? Number)?.toLong()?.toBigInteger()
                     if (feedId != null) {
-                        SDKLogger.info(TAG, "Publisher feed unpublished: $feedId")
-                        subscriptionManager.unsubscribe(sId, feedId)
+                        SDKLogger.info(TAG, "Feed $feedId unpublished in room $currentRoom")
+                        subscriptionManager.unsubscribeFrom(sId, feedId)
                     }
                 }
 
-                // Check for participant leaving
-                val leaving = data["leaving"]
+                // Publisher left the room
+                val leaving = dataMap["leaving"]
                 if (leaving != null && leaving != "ok") {
                     val feedId = (leaving as? Number)?.toLong()?.toBigInteger()
                     if (feedId != null) {
-                        SDKLogger.info(TAG, "Publisher feed left room: $feedId")
-                        subscriptionManager.unsubscribe(sId, feedId)
+                        SDKLogger.info(TAG, "Feed $feedId left room $currentRoom")
+                        subscriptionManager.unsubscribeFrom(sId, feedId)
                     }
                 }
 
-                // Check for room destroyed
-                if (data.containsKey("destroyed")) {
-                    SDKLogger.info(TAG, "Room destroyed: $currentRoom")
+                // Room destroyed
+                if (dataMap.containsKey("destroyed")) {
+                    SDKLogger.info(TAG, "Room $currentRoom was destroyed")
                     subscriptionManager.unsubscribeAll(sId)
                 }
             }

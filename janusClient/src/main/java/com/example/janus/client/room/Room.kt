@@ -150,11 +150,12 @@ class Room(
                 val joinResult = videoRoomPlugin.joinRoom(roomId, userId, displayName, role)
                 SDKLogger.info(TAG, "Successfully joined room $roomId with participantId: ${joinResult.participantId}")
 
-                // 7. Auto-subscribe to existing publishers
-                if (options.autoSubscribe) {
-                    joinResult.publishers.forEach { pub ->
-                        subscriptionManager.subscribe(sessionId, roomId, pub.feedId, pub.display)
-                    }
+                // 7. Auto-subscribe to all existing publishers in one shot
+                // (single subscriber handle for all feeds — matches videoroomtest.js)
+                if (options.autoSubscribe && joinResult.publishers.isNotEmpty()) {
+                    subscriptionManager.subscribeTo(
+                        sessionId, roomId, joinResult.privateId, joinResult.publishers
+                    )
                 }
 
                 // 8. Publish Local Stream if enabled
@@ -331,6 +332,7 @@ class Room(
                     is SignalingEvent.UnsolicitedEvent -> {
                         videoRoomPlugin.handleUnsolicitedEvent(event.message, roomId)
                     }
+
                     is SignalingEvent.Disconnected -> {
                         if (_state.value == ConnectionState.CONNECTED) {
                             _state.value = ConnectionState.DISCONNECTED

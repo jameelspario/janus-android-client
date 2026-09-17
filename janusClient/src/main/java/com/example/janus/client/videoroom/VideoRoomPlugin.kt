@@ -25,6 +25,7 @@ import java.math.BigInteger
 /**
  * Coordinates the Janus VideoRoom plugin protocol for publishing, room joining, and
  * unsolicited signaling events (new publishers, leaving publishers, room destroyed, etc.).
+ * QTWQEQERUTQRQRV UIYR
  */
 class VideoRoomPlugin(
     private val scope: CoroutineScope,

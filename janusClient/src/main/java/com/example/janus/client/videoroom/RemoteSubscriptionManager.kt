@@ -2,10 +2,14 @@ package com.example.janus.client.videoroom
 
 import com.example.janus.client.SDKLogger
 import com.example.janus.client.signaling.JanusSignalingClient
+import com.example.janus.client.signaling.toJanusId
 import com.example.janus.client.track.RemoteAudioTrack
 import com.example.janus.client.track.RemoteVideoTrack
 import com.example.janus.client.track.Track
+import com.example.janus.client.webrtc.RemoteCandidateBuffer
+import com.example.janus.client.webrtc.SdpUtils.audioLevelOrNull
 import com.example.janus.client.webrtc.SdpUtils.createAnswerSuspend
+import com.example.janus.client.webrtc.SdpUtils.getStatsSuspend
 import com.example.janus.client.webrtc.SdpUtils.setLocalDescriptionSuspend
 import com.example.janus.client.webrtc.SdpUtils.setRemoteDescriptionSuspend
 import com.example.janus.client.webrtc.WebRtcEngine
@@ -64,7 +68,10 @@ class RemoteSubscriptionManager(
     // Cached session/room/privateId for deferred re-use
     @Volatile private var activeSessionId: BigInteger? = null
     @Volatile private var activeRoomId: Int = 0
-    @Volatile private var activePrivateId: Int? = null
+    @Volatile private var activePrivateId: Long? = null
+
+    /** Candidates Janus trickles for the subscriber handle (see [addRemoteCandidate]). */
+    private val subscriberCandidates = RemoteCandidateBuffer(TAG)
 
     // ── State maps ───────────────────────────────────────────────────────────
 
@@ -101,7 +108,7 @@ class RemoteSubscriptionManager(
     fun subscribeTo(
         sessionId: BigInteger,
         roomId: Int,
-        privateId: Int?,
+        privateId: Long?,
         feeds: List<PublisherFeedInfo>
     ) {
         if (feeds.isEmpty()) return
@@ -167,26 +174,87 @@ class RemoteSubscriptionManager(
         // Notify UI immediately
         listener.onRemoteTrackUnsubscribed(feedId, null)
 
+        // Detach handle when last feed is gone - no point renegotiating an empty subscription.
+        if (subscribedFeeds.isEmpty()) {
+            SDKLogger.info(TAG, "No feeds remaining — detaching subscriber handle")
+            cleanupHandle(sessionId)
+            return
+        }
+
         if (handleId != null) {
             scope.launch(Dispatchers.IO) {
                 try {
+                    // app: unsubscribeStream → {request:"unsubscribe", streams:[{feed}]}
                     val body = mapOf<String, Any>(
                         "request" to "unsubscribe",
                         "streams" to listOf(mapOf("feed" to feedId.toLong()))
                     )
-                    signalingClient.sendMessage(sessionId, handleId, body)
+                    val response = signalingClient.sendMessage(sessionId, handleId, body)
                     SDKLogger.info(TAG, "Sent unsubscribe for feed $feedId")
+                    // Janus answers with "updated" + a new offer that must be answered, or the
+                    // subscription stalls.
+                    updateSubStreamsFromData(response.pluginDataMap)
+                    response.jsep?.let { renegotiateSubscriberPc(sessionId, handleId, it) }
                 } catch (e: Exception) {
                     SDKLogger.warn(TAG, "Error sending unsubscribe for feed $feedId: ${e.message}")
                 }
             }
         }
+    }
 
-        // Detach handle when last feed is gone
-        if (subscribedFeeds.isEmpty()) {
-            SDKLogger.info(TAG, "No feeds remaining — detaching subscriber handle")
-            cleanupHandle(sessionId)
+    /** A candidate Janus trickled for the subscriber handle. */
+    fun addRemoteCandidate(senderHandleId: BigInteger, candidate: Map<String, Any>?) {
+        if (senderHandleId != subscriberHandleId) return
+        subscriberCandidates.add(subscriberPc, candidate)
+    }
+
+    /** `webrtcup` / `media` / `slowlink` / `hangup` / `detached` on the subscriber handle. */
+    fun handleHandleEvent(type: String, senderHandleId: BigInteger, raw: Map<String, Any>) {
+        if (senderHandleId != subscriberHandleId) return
+        when (type) {
+            "webrtcup" -> SDKLogger.info(TAG, "Subscriber PeerConnection is up")
+            "media" -> SDKLogger.debug(TAG, "Subscriber media ${raw["type"]} receiving=${raw["receiving"]} mid=${raw["mid"]}")
+            "slowlink" -> SDKLogger.warn(TAG, "Subscriber slowlink: $raw")
+            "hangup" -> SDKLogger.warn(TAG, "Subscriber hung up: ${raw["reason"]}")
+            "detached" -> {
+                SDKLogger.warn(TAG, "Subscriber handle detached by Janus")
+                activeSessionId?.let { unsubscribeAll(it) }
+            }
         }
+    }
+
+    /**
+     * Incoming audio level (0..1) per subscribed feed, from the subscriber PeerConnection's
+     * `inbound-rtp` audio stats (app's JanusService.checkAudioLevels, incoming side).
+     */
+    suspend fun remoteAudioLevels(): Map<BigInteger, Float> {
+        val pc = subscriberPc ?: return emptyMap()
+        val report = try { pc.getStatsSuspend() } catch (e: Exception) { return emptyMap() }
+
+        // Older WebRTC builds don't put "mid" on inbound-rtp - fall back to the receiving
+        // track's id → transceiver mid.
+        val midByTrackId: Map<String, String> by lazy {
+            try {
+                pc.transceivers.mapNotNull { t ->
+                    val id = t.receiver?.track()?.id() ?: return@mapNotNull null
+                    val mid = t.mid ?: return@mapNotNull null
+                    id to mid
+                }.toMap()
+            } catch (e: Exception) { emptyMap() }
+        }
+
+        val levels = mutableMapOf<BigInteger, Float>()
+        report.statsMap.values
+            .filter { it.type == "inbound-rtp" && it.members["kind"] == "audio" }
+            .forEach { stat ->
+                val level = stat.audioLevelOrNull() ?: return@forEach
+                val mid = stat.members["mid"] as? String
+                    ?: (stat.members["trackIdentifier"] as? String)?.let { midByTrackId[it] }
+                    ?: return@forEach
+                val feedId = subStreams[mid]?.feedId ?: return@forEach
+                levels[feedId] = maxOf(level, levels[feedId] ?: 0f)
+            }
+        return levels
     }
 
     /**
@@ -251,7 +319,7 @@ class RemoteSubscriptionManager(
     private suspend fun createSubscriberHandle(
         sessionId: BigInteger,
         roomId: Int,
-        privateId: Int?,
+        privateId: Long?,
         feeds: List<PublisherFeedInfo>
     ) {
         SDKLogger.info(TAG, "Attaching subscriber handle for ${feeds.size} feed(s): ${feeds.map { it.feedId }}")
@@ -267,7 +335,9 @@ class RemoteSubscriptionManager(
             "request" to "join",
             "ptype"   to "subscriber",
             "room"    to roomId,
-            "streams" to streamsArray
+            "streams" to streamsArray,
+            // app's VideoRoomManager.subscribe sends use_msid:false
+            "use_msid" to false
         )
         // private_id links us to the publisher handle (required on most Janus rooms)
         privateId?.let { joinBody["private_id"] = it }
@@ -361,13 +431,17 @@ class RemoteSubscriptionManager(
         subscriberPc = pc
 
         pc.setRemoteDescriptionSuspend(SessionDescription(SessionDescription.Type.OFFER, offerSdp))
+        subscriberCandidates.flush(pc)
         val answer = pc.createAnswerSuspend(recvOnlyConstraints())
         pc.setLocalDescriptionSuspend(answer)
 
         val startBody  = mapOf<String, Any>("request" to "start", "room" to activeRoomId)
         val answerJsep = mapOf("type" to answer.type.canonicalForm(), "sdp" to answer.description)
 
-        signalingClient.sendMessage(sessionId, handleId, startBody, answerJsep)
+        val started = signalingClient.sendMessage(sessionId, handleId, startBody, answerJsep)
+        if (started.pluginDataMap["started"] != "ok") {
+            SDKLogger.warn(TAG, "Subscriber start not ok: ${started.rawJson}")
+        }
         SDKLogger.info(TAG, "Subscriber PC started for ${subscribedFeeds.size} feed(s)")
     }
 
@@ -384,6 +458,7 @@ class RemoteSubscriptionManager(
 
         try {
             pc.setRemoteDescriptionSuspend(SessionDescription(SessionDescription.Type.OFFER, offerSdp))
+            subscriberCandidates.flush(pc)
             val answer = pc.createAnswerSuspend(recvOnlyConstraints())
             pc.setLocalDescriptionSuspend(answer)
 
@@ -435,7 +510,9 @@ class RemoteSubscriptionManager(
             }
         }
 
-        override fun onIceCandidatesRemoved(c: Array<IceCandidate>) {}
+        override fun onIceCandidatesRemoved(c: Array<IceCandidate>) {
+            subscriberPc?.removeIceCandidates(c)
+        }
         override fun onAddStream(s: MediaStream) {}
         override fun onRemoveStream(s: MediaStream) {}
         override fun onDataChannel(d: DataChannel) {}
@@ -483,6 +560,8 @@ class RemoteSubscriptionManager(
     private fun deliverTrack(mid: String, track: org.webrtc.MediaStreamTrack) {
         val info = subStreams[mid] ?: run {
             SDKLogger.warn(TAG, "deliverTrack: still no subStreamInfo for mid=$mid — dropping")
+            // Let a later onTrack for this mid (after the next "updated") deliver it.
+            deliveredMids.remove(mid)
             return
         }
         SDKLogger.info(TAG, "Delivering ${info.type} track mid=$mid → feed=${info.feedId} (${info.feedDisplay})")
@@ -535,8 +614,14 @@ class RemoteSubscriptionManager(
         val streamsList = data["streams"] as? List<*> ?: return
         streamsList.forEach { item ->
             if (item is Map<*, *>) {
-                val mid     = item["mid"] as? String ?: return@forEach
-                val feedId  = (item["feed_id"] as? Number)?.toLong()?.toBigInteger() ?: return@forEach
+                val mid     = item["mid"]?.toString() ?: return@forEach
+                // Inactive m-line (feed gone) - Janus may reuse this mid for another feed later.
+                if (item["active"] == false) {
+                    subStreams.remove(mid)
+                    deliveredMids.remove(mid)
+                    return@forEach
+                }
+                val feedId  = item["feed_id"].toJanusId() ?: return@forEach
                 val display = item["feed_display"] as? String ?: subscribedFeeds[feedId] ?: ""
                 val type    = item["type"] as? String ?: "unknown"
                 val codec   = item["codec"] as? String
@@ -565,6 +650,7 @@ class RemoteSubscriptionManager(
     private fun cleanupHandle(sessionId: BigInteger) {
         val handleId = subscriberHandleId ?: return
         subscriberHandleId = null
+        subscriberCandidates.clear()
 
         scope.launch(Dispatchers.IO) {
             try {

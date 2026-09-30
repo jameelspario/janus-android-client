@@ -44,6 +44,7 @@ data class SubStreamInfo(
 data class VideoRoomJoinResult(
     val roomId: Int,
     val participantId: String,
-    val privateId: Int?,
+    /** Janus private ids are unsigned 32-bit - kept as Long so large ones don't overflow. */
+    val privateId: Long?,
     val publishers: List<PublisherFeedInfo>
 )

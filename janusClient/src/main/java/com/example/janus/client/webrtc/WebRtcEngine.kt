@@ -94,6 +94,7 @@ class WebRtcEngine(
 
         return try {
             val videoSource = factory.createVideoSource(false)
+            options.videoProcessor?.let { videoSource.setVideoProcessor(it) }
             surfaceTextureHelper = SurfaceTextureHelper.create("JanusCaptureThread", eglBaseContext)
             capturer.initialize(surfaceTextureHelper, context, videoSource.capturerObserver)
             capturer.startCapture(options.videoWidth, options.videoHeight, options.videoFps)
@@ -104,6 +105,28 @@ class WebRtcEngine(
             SDKLogger.error(TAG, "Failed to create local video track", e)
             null
         }
+    }
+
+    /** Fully releases the camera capturer and its capture thread, so a later
+     * [createLocalVideoTrack] starts from a clean capturer instead of leaking the old one. */
+    fun releaseCamera() {
+        cameraManager.dispose()
+        surfaceTextureHelper?.dispose()
+        surfaceTextureHelper = null
+    }
+
+    /** Stops camera frames without tearing down the track - see [startCapture]. */
+    fun stopCapture() {
+        try {
+            cameraManager.getCapturer()?.stopCapture()
+        } catch (e: Exception) {
+            SDKLogger.warn(TAG, "stopCapture failed: ${e.message}")
+        }
+    }
+
+    /** Restarts camera frames after [stopCapture], at the configured size/fps. */
+    fun startCapture() {
+        cameraManager.getCapturer()?.startCapture(options.videoWidth, options.videoHeight, options.videoFps)
     }
 
     fun switchCamera(onSuccess: ((Boolean) -> Unit)? = null) {

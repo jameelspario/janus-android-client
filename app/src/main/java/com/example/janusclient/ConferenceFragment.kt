@@ -17,7 +17,6 @@ import androidx.recyclerview.widget.LinearLayoutManager
 import androidx.recyclerview.widget.RecyclerView
 import com.example.janus.client.Janus
 import com.example.janus.client.UserRole
-import com.example.janus.client.room.ConnectionState
 import com.example.janus.client.room.Room
 import com.example.janus.client.room.RoomEvent
 import com.example.janus.client.room.RoomOptions

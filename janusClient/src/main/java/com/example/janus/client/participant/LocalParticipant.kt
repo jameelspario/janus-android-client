@@ -1,10 +1,7 @@
 package com.example.janus.client.participant
 
 import com.example.janus.client.UserRole
-import com.example.janus.client.track.LocalAudioTrack
 import com.example.janus.client.track.LocalTrackPublication
-import com.example.janus.client.track.LocalVideoTrack
-import com.example.janus.client.track.Track
 
 /**
  * Controller callback for [LocalParticipant] track actions handled by the Room/Engine.
@@ -48,12 +45,6 @@ class LocalParticipant(
     internal fun addPublication(publication: LocalTrackPublication) {
         trackMap[publication.sid] = publication
         syncTracks()
-    }
-
-    internal fun removePublication(sid: String): LocalTrackPublication? {
-        val pub = trackMap.remove(sid) as? LocalTrackPublication
-        syncTracks()
-        return pub
     }
 
     internal fun clearPublications() {

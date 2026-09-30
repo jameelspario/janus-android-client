@@ -12,9 +12,7 @@ import com.example.janus.client.signaling.SignalingEvent
 import com.example.janus.client.track.LocalAudioTrack
 import com.example.janus.client.track.LocalTrackPublication
 import com.example.janus.client.track.LocalVideoTrack
-import com.example.janus.client.track.RemoteAudioTrack
 import com.example.janus.client.track.RemoteTrackPublication
-import com.example.janus.client.track.RemoteVideoTrack
 import com.example.janus.client.track.Track
 import com.example.janus.client.videoroom.RemoteSubscriptionListener
 import com.example.janus.client.videoroom.RemoteSubscriptionManager
@@ -24,6 +22,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
@@ -80,7 +80,7 @@ class Room(
     private val webRtcEngine = WebRtcEngine(context, options)
     private val signalingClient = JanusSignalingClient(scope)
     private val subscriptionManager = RemoteSubscriptionManager(scope, signalingClient, webRtcEngine, this)
-    private val videoRoomPlugin = VideoRoomPlugin(scope, signalingClient, webRtcEngine, subscriptionManager)
+    private val videoRoomPlugin = VideoRoomPlugin(scope, signalingClient, webRtcEngine, subscriptionManager, options)
     private val keepAliveManager = KeepAliveManager(options.keepAliveIntervalMs) {
         val sId = videoRoomPlugin.sessionId
         if (sId != null && signalingClient.isConnected()) {
@@ -90,6 +90,18 @@ class Room(
 
     private val listeners = CopyOnWriteArrayList<RoomListener>()
     private var signalingEventsJob: Job? = null
+    private var audioLevelJob: Job? = null
+
+    // ── Audio Levels ──
+    private val _audioLevels = MutableStateFlow<Map<String, Float>>(emptyMap())
+
+    /**
+     * Latest audio level (0..1) per participant, keyed by [com.example.janus.client.participant.Participant.identity]
+     * (the local participant's identity, and each remote's feed id). Sampled every
+     * [RoomOptions.audioLevelIntervalMs] from WebRTC stats - outgoing `media-source` for this
+     * device, incoming `inbound-rtp` for everyone else - same source the app's JanusService uses.
+     */
+    val audioLevels: StateFlow<Map<String, Float>> = _audioLevels.asStateFlow()
 
     // ── Local Media Tracks ──
     private var localAudioTrack: LocalAudioTrack? = null
@@ -97,6 +109,13 @@ class Room(
 
     init {
         localParticipant = LocalParticipant("local", "Me", UserRole.GUEST, this)
+
+        videoRoomPlugin.onPublisherTalking = { feedId, talking ->
+            remoteParticipantMap[feedId.toString()]?.updateSpeaking(talking)
+        }
+        videoRoomPlugin.onPublisherHangup = { reason ->
+            SDKLogger.warn(TAG, "Janus hung up our publisher PeerConnection: $reason")
+        }
     }
 
     /**
@@ -165,6 +184,7 @@ class Room(
 
                 _state.value = ConnectionState.CONNECTED
                 emitEvent(RoomEvent.Connected(this))
+                startAudioLevelSampling()
 
             } catch (e: Exception) {
                 SDKLogger.error(TAG, "Connection failed", e)
@@ -206,6 +226,35 @@ class Room(
     }
 
     /**
+     * Stops publishing local media (the publisher peer connection is closed via Janus's
+     * `unpublish`) and releases the local tracks, while staying connected and subscribed - the
+     * reverse of [publishLocalMedia], e.g. a cohost stepping back down to viewer.
+     */
+    suspend fun unpublishLocalMedia() {
+        videoRoomPlugin.unpublishLocalStream()
+
+        localParticipant.tracks.value.values.forEach { pub ->
+            emitEvent(RoomEvent.TrackUnpublished(localParticipant, pub))
+        }
+        localVideoTrack?.dispose()
+        localVideoTrack = null
+        localAudioTrack?.dispose()
+        localAudioTrack = null
+        webRtcEngine.releaseCamera()
+        localParticipant.clearPublications()
+        localParticipant.isMicrophoneEnabled = false
+        localParticipant.isCameraEnabled = false
+    }
+
+    /** Pauses the local camera capture (e.g. app backgrounded) without unpublishing. */
+    fun pauseCapture() = webRtcEngine.stopCapture()
+
+    /** Resumes the local camera capture after [pauseCapture]; a no-op if not capturing. */
+    fun resumeCapture() {
+        if (localVideoTrack != null) webRtcEngine.startCapture()
+    }
+
+    /**
      * Disconnects from the current room and cleans up all active tracks and peer connections.
      */
     suspend fun disconnect() {
@@ -214,7 +263,14 @@ class Room(
 
             SDKLogger.info(TAG, "Disconnecting from room ${roomId}...")
             try {
+                // Same way out as the app's JanusService: unpublish → leave → detach, then
+                // destroy the session so Janus frees it immediately instead of on timeout.
                 roomId?.let { videoRoomPlugin.leaveRoom(it) }
+                videoRoomPlugin.sessionId?.let { sId ->
+                    subscriptionManager.unsubscribeAll(sId)
+                    videoRoomPlugin.detach()
+                    signalingClient.destroySession(sId)
+                }
             } catch (e: Exception) {
                 SDKLogger.warn(TAG, "Error leaving room: ${e.message}")
             }
@@ -229,6 +285,9 @@ class Room(
         keepAliveManager.stop()
         signalingEventsJob?.cancel()
         signalingEventsJob = null
+        audioLevelJob?.cancel()
+        audioLevelJob = null
+        _audioLevels.value = emptyMap()
 
         videoRoomPlugin.sessionId?.let { sId ->
             subscriptionManager.unsubscribeAll(sId)
@@ -244,7 +303,36 @@ class Room(
         _remoteParticipants.value = emptyMap()
 
         signalingClient.disconnect()
+        videoRoomPlugin.sessionId = null
+        videoRoomPlugin.publisherHandleId = null
         webRtcEngine.dispose()
+    }
+
+    /** Polls WebRTC stats for audio levels while connected (app: checkAudioLevels every 400 ms). */
+    private fun startAudioLevelSampling() {
+        audioLevelJob?.cancel()
+        if (options.audioLevelIntervalMs <= 0) return
+        audioLevelJob = scope.launch {
+            while (isActive) {
+                delay(options.audioLevelIntervalMs)
+                val levels = mutableMapOf<String, Float>()
+
+                videoRoomPlugin.localAudioLevel()?.let { level ->
+                    val muted = localParticipant.audioTracks.firstOrNull()?.isMuted?.value == true
+                    val effective = if (muted) 0f else level
+                    levels[localParticipant.identity] = effective
+                    localParticipant.updateAudioLevel(effective, options.speakingThreshold)
+                }
+
+                subscriptionManager.remoteAudioLevels().forEach { (feedId, level) ->
+                    val identity = feedId.toString()
+                    levels[identity] = level
+                    remoteParticipantMap[identity]?.updateAudioLevel(level, options.speakingThreshold)
+                }
+
+                _audioLevels.value = levels
+            }
+        }
     }
 
     // ── LocalParticipantController Implementation ──
@@ -331,6 +419,26 @@ class Room(
                 when (event) {
                     is SignalingEvent.UnsolicitedEvent -> {
                         videoRoomPlugin.handleUnsolicitedEvent(event.message, roomId)
+                    }
+
+                    is SignalingEvent.RemoteCandidate -> {
+                        videoRoomPlugin.addRemoteCandidate(event.senderHandleId, event.candidate)
+                    }
+
+                    is SignalingEvent.HandleEvent -> {
+                        videoRoomPlugin.handleHandleEvent(event.type, event.senderHandleId, event.raw)
+                    }
+
+                    is SignalingEvent.SessionTimeout -> {
+                        SDKLogger.error(TAG, "Janus session ${event.sessionId} timed out")
+                        if (_state.value == ConnectionState.CONNECTED) {
+                            _state.value = ConnectionState.DISCONNECTED
+                            emitEvent(RoomEvent.Disconnected(this@Room, RuntimeException("Janus session timed out")))
+                        }
+                    }
+
+                    is SignalingEvent.ServerError -> {
+                        SDKLogger.warn(TAG, "Janus error ${event.code}: ${event.reason}")
                     }
 
                     is SignalingEvent.Disconnected -> {

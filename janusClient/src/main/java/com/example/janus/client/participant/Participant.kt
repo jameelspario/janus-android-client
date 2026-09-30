@@ -1,10 +1,8 @@
 package com.example.janus.client.participant
 
 import com.example.janus.client.UserRole
-import com.example.janus.client.track.AudioTrack
 import com.example.janus.client.track.Track
 import com.example.janus.client.track.TrackPublication
-import com.example.janus.client.track.VideoTrack
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -24,6 +22,21 @@ abstract class Participant(
 
     protected val _isSpeaking = MutableStateFlow(false)
     val isSpeaking: StateFlow<Boolean> = _isSpeaking.asStateFlow()
+
+    /** Latest audio level (0..1) - mic capture level for the local participant, received level
+     * for a remote one. Sampled by the Room from WebRTC stats. */
+    protected val _audioLevel = MutableStateFlow(0f)
+    val audioLevel: StateFlow<Float> = _audioLevel.asStateFlow()
+
+    internal fun updateAudioLevel(level: Float, speakingThreshold: Float) {
+        _audioLevel.value = level
+        _isSpeaking.value = level > speakingThreshold
+    }
+
+    /** Janus `talking` / `stopped-talking` event for this participant. */
+    internal fun updateSpeaking(speaking: Boolean) {
+        _isSpeaking.value = speaking
+    }
 
     val audioTracks: List<TrackPublication>
         get() = trackMap.values.filter { it.kind == Track.Kind.AUDIO }

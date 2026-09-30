@@ -68,7 +68,12 @@ fun JSONArray.toPlainList(): List<Any> {
     return list
 }
 
-fun Any?.toJanusId(): BigInteger?  = when(this){
+/**
+ * Reads a Janus id (session, handle, feed, private id) whatever JSON type the server used:
+ * a number normally, or a string when the room was created with `string_ids`. Same tolerance
+ * as the app's own client (`BigInteger(obj.getString("id"))`).
+ */
+fun Any?.toJanusId(): BigInteger? = when (this) {
     is BigInteger -> this
     is Number -> BigInteger.valueOf(this.toLong())
     is String -> this.toBigIntegerOrNull()

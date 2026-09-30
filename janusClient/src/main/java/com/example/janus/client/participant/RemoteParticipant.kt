@@ -4,7 +4,6 @@ import com.example.janus.client.UserRole
 import com.example.janus.client.track.RemoteAudioTrack
 import com.example.janus.client.track.RemoteTrackPublication
 import com.example.janus.client.track.RemoteVideoTrack
-import com.example.janus.client.track.Track
 import java.math.BigInteger
 
 /**
@@ -32,13 +31,5 @@ class RemoteParticipant(
         val pub = trackMap.remove(sid) as? RemoteTrackPublication
         syncTracks()
         return pub
-    }
-
-    internal fun setTrackForPublication(sid: String, track: Track) {
-        val pub = trackMap[sid] as? RemoteTrackPublication
-        if (pub != null) {
-            pub.track = track
-            syncTracks()
-        }
     }
 }

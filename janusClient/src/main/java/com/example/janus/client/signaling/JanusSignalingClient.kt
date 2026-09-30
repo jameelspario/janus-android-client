@@ -27,6 +27,9 @@ sealed class SignalingEvent {
     data class Disconnected(val code: Int, val reason: String) : SignalingEvent()
     data class Error(val error: Throwable) : SignalingEvent()
     data class UnsolicitedEvent(val message: Map<String, Any>, val jsep: Map<String, Any>?) : SignalingEvent()
+    data class RemoteCandidate(val senderHandleId: BigInteger, val candidate: Map<String, Any>?) : SignalingEvent()
+    data class HandleEvent(val type:String, val senderHandleId: BigInteger, val raw: Map<String, Any>?) : SignalingEvent()
+    data class ServerError(val code: Int, val reason: String) : SignalingEvent()
 }
 
 /**

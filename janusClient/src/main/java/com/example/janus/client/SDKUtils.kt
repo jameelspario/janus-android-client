@@ -377,16 +377,16 @@ object PermissionHelper {
         )
     }
 
-    fun hasPermission(context: android.content.Context, permission: String): Boolean {
-        return androidx.core.content.ContextCompat.checkSelfPermission(
-            context,
-            permission
-        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
-    }
-
-    fun hasAllPermissions(context: android.content.Context): Boolean {
-        return getRequiredPermissions().all { hasPermission(context, it) }
-    }
+//    fun hasPermission(context: android.content.Context, permission: String): Boolean {
+//        return androidx.core.content.ContextCompat.checkSelfPermission(
+//            context,
+//            permission
+//        ) == android.content.pm.PackageManager.PERMISSION_GRANTED
+//    }
+//
+//    fun hasAllPermissions(context: android.content.Context): Boolean {
+//        return getRequiredPermissions().all { hasPermission(context, it) }
+//    }
 }
 
 /**

@@ -1,8 +1,5 @@
 package com.example.janus.client
 
-import android.Manifest
-import android.content.pm.PackageManager
-import androidx.core.content.ContextCompat
 import org.json.JSONArray
 import org.webrtc.AudioTrack
 import org.webrtc.IceCandidate

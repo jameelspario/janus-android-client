@@ -67,3 +67,10 @@ fun JSONArray.toPlainList(): List<Any> {
     }
     return list
 }
+
+fun Any?.toJanusId(): BigInteger?  = when(this){
+    is BigInteger -> this
+    is Number -> BigInteger.valueOf(this.toLong())
+    is String -> this.toBigIntegerOrNull()
+    else -> null
+}
